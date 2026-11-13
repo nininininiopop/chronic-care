@@ -1,0 +1,230 @@
+"""국민건강보험공단 고혈압·당뇨병 의료이용률(2024) 대시보드
+
+실행:
+    pip install -r requirements.txt
+    streamlit run main.py
+
+CSV 파일은 main.py와 같은 폴더(또는 data/ 폴더)에 두면 자동으로 읽습니다.
+파일이 없으면 화면에서 직접 업로드할 수 있습니다.
+"""
+
+import io
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+st.set_page_config(page_title="고혈압·당뇨병 의료이용률 2024", layout="wide")
+
+BASE_DIR = Path(__file__).parent
+
+GENDER_MAP = {"1": "남성", "2": "여성", "ALL": "전체"}
+AGE_MAP = {
+    "00": "0~9세",
+    "10": "10대",
+    "20": "20대",
+    "30": "30대",
+    "40": "40대",
+    "50": "50대",
+    "60": "60대",
+    "70": "70대",
+    "80": "80세 이상",
+    "ALL": "전체",
+}
+AGE_ORDER = list(AGE_MAP.values())
+GENDER_ORDER = ["전체", "남성", "여성"]
+
+
+def find_csv() -> Path | None:
+    """main.py 폴더 또는 data/ 폴더에서 CSV 파일을 찾는다."""
+    for folder in (BASE_DIR, BASE_DIR / "data"):
+        if not folder.is_dir():
+            continue
+        files = sorted(p for p in folder.iterdir() if p.suffix.lower() == ".csv")
+        if files:
+            return files[0]
+    return None
+
+
+@st.cache_data(show_spinner="데이터 불러오는 중...")
+def load_data(raw: bytes) -> pd.DataFrame:
+    """CSV 바이트를 읽어 분석하기 쉬운 형태로 정리한다. (인코딩: UTF-8 또는 CP949)"""
+    df = None
+    for enc in ("utf-8-sig", "cp949"):
+        try:
+            df = pd.read_csv(
+                io.BytesIO(raw),
+                encoding=enc,
+                dtype={"성별": str, "연령그룹": str},
+            )
+            break
+        except UnicodeDecodeError:
+            continue
+    if df is None:
+        raise ValueError("CSV 인코딩을 인식하지 못했습니다. (UTF-8 / CP949만 지원)")
+
+    df = df.rename(
+        columns={"분모(명)": "분모", "분자(명)": "분자", "고당의료이용률": "이용률"}
+    )
+
+    # 집계 단위 구분: 전국 / 시도 합계 / 시군구
+    df["구분"] = "시군구"
+    df.loc[df["시군구"] == "전체", "구분"] = "시도"
+    df.loc[df["시도"] == "전국", "구분"] = "전국"
+
+    df["지역"] = df["시도"]
+    mask = df["구분"] == "시군구"
+    df.loc[mask, "지역"] = df.loc[mask, "시도"] + " " + df.loc[mask, "시군구"]
+
+    df["성별"] = df["성별"].map(GENDER_MAP)
+    df["연령"] = pd.Categorical(
+        df["연령그룹"].map(AGE_MAP), categories=AGE_ORDER, ordered=True
+    )
+    return df
+
+
+# ---------------------------------------------------------------- 데이터 로드
+csv_path = find_csv()
+if csv_path is not None:
+    raw_bytes = csv_path.read_bytes()
+    st.caption(f"데이터 파일: {csv_path.name}")
+else:
+    uploaded = st.file_uploader("CSV 파일을 업로드하세요", type=["csv"])
+    if uploaded is None:
+        st.info("main.py와 같은 폴더에 CSV를 두거나 위에서 업로드해 주세요.")
+        st.stop()
+    raw_bytes = uploaded.getvalue()
+
+try:
+    data = load_data(raw_bytes)
+except Exception as e:  # noqa: BLE001
+    st.error(f"데이터를 읽는 중 오류가 발생했습니다: {e}")
+    st.stop()
+
+year = int(data["기준연도"].iloc[0])
+st.title(f"고혈압·당뇨병 의료이용률 ({year})")
+st.caption("출처: 국민건강보험공단 · 이용률(%) = 분자(명) ÷ 분모(명) × 100")
+
+# ---------------------------------------------------------------- 사이드바
+st.sidebar.header("필터")
+sel_gender = st.sidebar.selectbox("성별", GENDER_ORDER, index=0)
+sel_age = st.sidebar.selectbox("연령대", AGE_ORDER, index=len(AGE_ORDER) - 1)
+
+nation = data[data["구분"] == "전국"]
+national_row = nation[(nation["성별"] == sel_gender) & (nation["연령"] == sel_age)]
+national_rate = float(national_row["이용률"].iloc[0]) if len(national_row) else None
+
+tab_nation, tab_sido, tab_sigungu, tab_raw = st.tabs(
+    ["전국 개요", "시도 비교", "시군구 순위", "원본 데이터"]
+)
+
+# ---------------------------------------------------------------- 전국 개요
+with tab_nation:
+    overall = nation[(nation["성별"] == "전체") & (nation["연령"] == "전체")].iloc[0]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("전국 이용률", f"{overall['이용률']:.2f}%")
+    c2.metric("대상자(분모)", f"{int(overall['분모']):,}명")
+    c3.metric("이용자(분자)", f"{int(overall['분자']):,}명")
+
+    by_age = nation[nation["연령"] != "전체"]
+    fig = px.line(
+        by_age,
+        x="연령",
+        y="이용률",
+        color="성별",
+        markers=True,
+        category_orders={"연령": AGE_ORDER[:-1], "성별": GENDER_ORDER},
+        title="연령대·성별 의료이용률",
+    )
+    fig.update_layout(yaxis_title="이용률(%)", xaxis_title=None)
+    st.plotly_chart(fig, use_container_width=True)
+
+# ---------------------------------------------------------------- 시도 비교
+with tab_sido:
+    sido = data[
+        (data["구분"] == "시도")
+        & (data["성별"] == sel_gender)
+        & (data["연령"] == sel_age)
+    ].sort_values("이용률", ascending=False)
+
+    fig = px.bar(
+        sido,
+        x="이용률",
+        y="지역",
+        orientation="h",
+        text="이용률",
+        title=f"시도별 이용률 · {sel_gender} / {sel_age}",
+    )
+    fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+    fig.update_layout(
+        yaxis=dict(autorange="reversed", title=None),
+        xaxis_title="이용률(%)",
+        height=560,
+    )
+    if national_rate is not None:
+        fig.add_vline(
+            x=national_rate,
+            line_dash="dash",
+            annotation_text=f"전국 {national_rate:.1f}%",
+        )
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(
+        sido[["지역", "분모", "분자", "이용률"]].reset_index(drop=True),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# ---------------------------------------------------------------- 시군구 순위
+with tab_sigungu:
+    sgg = data[
+        (data["구분"] == "시군구")
+        & (data["성별"] == sel_gender)
+        & (data["연령"] == sel_age)
+    ]
+
+    f1, f2, f3 = st.columns(3)
+    sido_options = sorted(sgg["시도"].unique())
+    sel_sido = f1.multiselect("시도 (비우면 전체)", sido_options)
+    min_den = f2.slider("최소 분모(명)", 0, 20000, 1000, step=500)
+    top_n = f3.slider("표시 개수", 5, 30, 10)
+
+    if sel_sido:
+        sgg = sgg[sgg["시도"].isin(sel_sido)]
+    sgg = sgg[sgg["분모"] >= min_den]
+
+    st.caption(
+        f"조건에 맞는 시군구 {len(sgg)}곳 · 분모가 작은 지역은 비율 변동이 클 수 있어요."
+    )
+
+    if sgg.empty:
+        st.warning("조건에 맞는 데이터가 없습니다. 필터를 완화해 보세요.")
+    else:
+        top = sgg.nlargest(top_n, "이용률")
+        bottom = sgg.nsmallest(top_n, "이용률")
+        col_a, col_b = st.columns(2)
+        for col, frame, title in (
+            (col_a, top, f"상위 {len(top)}"),
+            (col_b, bottom, f"하위 {len(bottom)}"),
+        ):
+            fig = px.bar(frame, x="이용률", y="지역", orientation="h", text="이용률", title=title)
+            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+            fig.update_layout(yaxis=dict(autorange="reversed", title=None), xaxis_title="이용률(%)")
+            col.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(
+            sgg.sort_values("이용률", ascending=False)[["지역", "분모", "분자", "이용률"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+# ---------------------------------------------------------------- 원본 데이터
+with tab_raw:
+    view = data.drop(columns=["연령그룹"])
+    st.dataframe(view, use_container_width=True, hide_index=True)
+    st.download_button(
+        "CSV 다운로드 (UTF-8)",
+        view.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"고당의료이용률_{year}_정리본.csv",
+        mime="text/csv",
+    )
